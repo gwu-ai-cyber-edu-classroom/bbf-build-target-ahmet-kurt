@@ -1,0 +1,10 @@
+# Runtime data (the SQLite DB is recreated/seeded on startup)
+data/
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
