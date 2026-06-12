@@ -1,9 +1,19 @@
 name: issue-events
 
-# Handles two things in one workflow:
-#   1. Slash commands in issue comments (/repro-confirmed, /repro-failed,
-#      /out-of-scope) -> apply state labels.
-#   2. Issue closed via merged PR -> apply 'fixed' label.
+# Slash-command lifecycle for Break Report issues:
+#   /repro-confirmed  (target)      -> valid      (the break scores)
+#   /repro-failed     (target)      -> invalid
+#   /out-of-scope     (facilitator) -> invalid
+#   /fix-confirmed    (breaker)     -> fixed       (fix verified by the team that filed it)
+#   /fix-failed       (breaker)     -> fix-rejected + reopen (the fix didn't hold)
+#   /duplicate-of #N  (facilitator) -> duplicate + dup-of:N   (merge this break into #N's group:
+#                                      it stops earning points and stops counting against the
+#                                      target, because it is the same root-cause defect as #N)
+#   /distinct         (facilitator) -> remove duplicate / dup-of:* (undo a merge)
+# Plus: when a merged PR closes a valid issue, it becomes `fix-claimed`
+# (awaiting the breaker's confirmation) — not `fixed` until the breaker confirms.
+#
+# Labels are auto-created so a missing label can't silently swallow a command.
 
 on:
   issue_comment:
@@ -16,67 +26,89 @@ permissions:
   contents: read
 
 jobs:
-  slash-command:
+  slash:
     if: github.event_name == 'issue_comment' && !github.event.issue.pull_request
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
+      BODY: ${{ github.event.comment.body }}
+      ASSOC: ${{ github.event.comment.author_association }}
+      COMMENTER: ${{ github.event.comment.user.login }}
+      AUTHOR: ${{ github.event.issue.user.login }}
     steps:
-      - name: Parse slash command
-        id: cmd
-        env:
-          BODY: ${{ github.event.comment.body }}
-          ASSOCIATION: ${{ github.event.comment.author_association }}
+      - name: Handle slash command
         run: |
-          set -euo pipefail
-          # Read up to the first newline of the comment body.
-          FIRST_LINE=$(printf '%s' "$BODY" | head -c 200 | head -n1 | tr -d '\r' | xargs)
-          ADD=""
-          REMOVE=""
-          case "$FIRST_LINE" in
+          set -uo pipefail
+          CMD=$(printf '%s' "$BODY" | head -c 200 | head -n1 | tr -d '\r' | xargs)
+          ensure() { gh label create "$1" -R "$REPO" -c "$2" -d "$3" --force >/dev/null 2>&1 || true; }
+          addl()   { gh issue edit "$ISSUE" -R "$REPO" --add-label "$1" || true; }
+          reml()   { gh issue edit "$ISSUE" -R "$REPO" --remove-label "$1" || true; }
+          is_facilitator() { [[ "$ASSOC" == "MEMBER" || "$ASSOC" == "OWNER" || "$ASSOC" == "COLLABORATOR" ]]; }
+          is_breaker()     { [[ "$COMMENTER" == "$AUTHOR" ]] || is_facilitator; }
+
+          case "$CMD" in
             /repro-confirmed*)
-              ADD="valid"
-              REMOVE="invalid"
-              ;;
+              ensure valid 0E8A16 "Break confirmed reproducible"; addl valid; reml invalid ;;
             /repro-failed*)
-              ADD="invalid"
-              REMOVE="valid"
-              ;;
+              ensure invalid B60205 "Break failed repro or ruled out"; addl invalid; reml valid ;;
             /out-of-scope*)
-              # Facilitator-only: gated by org-membership.
-              if [[ "$ASSOCIATION" == "MEMBER" || "$ASSOCIATION" == "OWNER" || "$ASSOCIATION" == "COLLABORATOR" ]]; then
-                ADD="invalid"
-                REMOVE="valid"
-              else
-                echo "::notice::/out-of-scope ignored: author not an org member"
-              fi
-              ;;
-            *)
-              # Not a recognized slash command; nothing to do.
-              ;;
+              if is_facilitator; then
+                ensure invalid B60205 "Ruled out by a facilitator"; addl invalid; reml valid
+              else echo "::notice::/out-of-scope ignored: commenter is not an org member"; fi ;;
+            /fix-confirmed*)
+              # The team that FILED the break (the issue author) verifies the fix.
+              if is_breaker; then
+                ensure fixed 1D76DB "Fix confirmed by the breaker"
+                addl fixed; reml fix-claimed; reml fix-rejected
+              else echo "::notice::/fix-confirmed ignored: only the breaker who filed this issue (or a facilitator) can confirm the fix"; fi ;;
+            /fix-failed*)
+              if is_breaker; then
+                ensure fix-rejected D29922 "Fix did not hold — breaker re-broke it"
+                addl fix-rejected; reml fixed; reml fix-claimed
+                gh issue reopen "$ISSUE" -R "$REPO" || true
+              else echo "::notice::/fix-failed ignored: only the breaker who filed this issue (or a facilitator) can reject the fix"; fi ;;
+            /duplicate-of*)
+              # Facilitator merges this break into another issue's group (same root-cause defect).
+              if is_facilitator; then
+                N=$(printf '%s' "$CMD" | grep -oE '#?[0-9]+' | head -n1 | tr -d '#')
+                if [[ -n "$N" ]]; then
+                  ensure duplicate C5DEF5 "Same root-cause defect as another break"
+                  ensure "dup-of:$N" C5DEF5 "Merged into break #$N for scoring"
+                  # drop any stale dup-of:* before adding the new one
+                  gh issue view "$ISSUE" -R "$REPO" --json labels --jq '.labels[].name' \
+                    | grep -E '^dup-of:[0-9]+$' | grep -vx "dup-of:$N" \
+                    | while read -r L; do reml "$L"; done
+                  addl duplicate; addl "dup-of:$N"
+                  echo "::notice::marked #$ISSUE as duplicate of #$N"
+                else echo "::error::/duplicate-of needs an issue number, e.g. /duplicate-of #12"; fi
+              else echo "::notice::/duplicate-of ignored: commenter is not a facilitator"; fi ;;
+            /distinct*)
+              if is_facilitator; then
+                reml duplicate
+                gh issue view "$ISSUE" -R "$REPO" --json labels --jq '.labels[].name' \
+                  | grep -E '^dup-of:[0-9]+$' | while read -r L; do reml "$L"; done
+                echo "::notice::#$ISSUE un-merged (now scored as a distinct break)"
+              else echo "::notice::/distinct ignored: commenter is not a facilitator"; fi ;;
+            *) : ;;
           esac
-          echo "add=$ADD" >> "$GITHUB_OUTPUT"
-          echo "remove=$REMOVE" >> "$GITHUB_OUTPUT"
 
-      - name: Apply labels
-        if: steps.cmd.outputs.add != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-          ADD: ${{ steps.cmd.outputs.add }}
-          REMOVE: ${{ steps.cmd.outputs.remove }}
-        run: |
-          gh issue edit "$ISSUE" -R "$REPO" --add-label "$ADD" || true
-          if [[ -n "$REMOVE" ]]; then
-            gh issue edit "$ISSUE" -R "$REPO" --remove-label "$REMOVE" || true
-          fi
-
-  label-on-close:
+  fix-claim-on-close:
     if: github.event_name == 'issues' && github.event.action == 'closed' && contains(github.event.issue.labels.*.name, 'valid')
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
     steps:
-      - name: Add fixed label
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-        run: gh issue edit "$ISSUE" -R "$REPO" --add-label "fixed" || true
+      - name: Mark fix claimed (awaiting breaker confirmation)
+        run: |
+          set -uo pipefail
+          # If the breaker already confirmed it (label `fixed`), leave it.
+          if gh issue view "$ISSUE" -R "$REPO" --json labels --jq '.labels[].name' | grep -qx fixed; then
+            echo "Already breaker-confirmed (fixed); nothing to do."
+            exit 0
+          fi
+          gh label create fix-claimed E3B341 "Fix merged; awaiting breaker confirmation" -R "$REPO" --force >/dev/null 2>&1 || true
+          gh issue edit "$ISSUE" -R "$REPO" --add-label fix-claimed || true

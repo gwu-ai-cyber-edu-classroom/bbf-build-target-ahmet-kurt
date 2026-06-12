@@ -1,4 +1,3 @@
-[![Open in Codespaces](https://classroom.github.com/assets/launch-codespace-2972f46106e565e64193e422d61a12cf1da4916b45550586e14ef0a7c637dd04.svg)](https://classroom.github.com/open-in-codespaces?assignment_repo_id=24126372)
 # BBF Day — Your Team Repository
 
 This is your team's repository for the **Build-it / Break-it / Fix-it** day at the AI +
@@ -6,67 +5,21 @@ Cybersecurity Summer Institute.
 
 ## What you're building
 
-Your team picks **one** application to build from [BUILD-MENU.md](BUILD-MENU.md) — a CLI tool, a
-local web app, an API, a document generator, and so on. You also pick the platform (Python or
-Node). Whatever you choose, it must satisfy the **five-property contract** in [SPEC.md](SPEC.md):
+This run, every team builds a small **web app** — pick one from [BUILD-MENU.md](BUILD-MENU.md) and
+the platform (Python with Flask/FastAPI, or Node with Express). A running web app gives breakers
+an obvious HTTP surface to probe. Whatever you choose must satisfy the **five-property contract**
+in [SPEC.md](SPEC.md):
 
-- **P1 Confidentiality** — never leak the `CANARY_` secret.
+- **P1 Confidentiality** — never leak the `CANARY_` secret through the interface.
 - **P2 Correctness** — do your documented job right.
 - **P3 Input discipline** — handle bad input gracefully.
-- **P4 No injection / code execution** — never run user input as code.
-- **P5 Authorization & output safety** — (web/UI targets) require auth, no XSS.
+- **P4 No injection / code execution** — never run user input as code/SQL/path/template.
+- **P5 Authorization & output safety** — require auth for private data; no XSS.
 
-You all build different things, but breakers attack the **same properties**, which is what keeps
-the day fair and comparable. See BUILD-MENU.md for the menu and a beginner-friendly Claude prompt
-to scaffold your first version.
-
----
-
-## 🚀 Our target: Tiny URL Shortener (BUILD-MENU #15)
-
-A local Flask + SQLite URL shortener. Paste an `http`/`https` link, get a short code back;
-visiting `/<code>` 302-redirects to the original.
-
-**Run it:**
-
-```bash
-pip install -r requirements.txt
-python app.py
-# open http://127.0.0.1:5000
-```
-
-**One clear entry point:** the web UI at `http://127.0.0.1:5000`. JSON API and admin surface:
-
-| Method & path        | Auth                     | Purpose                                  |
-|----------------------|--------------------------|------------------------------------------|
-| `GET  /`             | none                     | Web form + public link directory         |
-| `POST /`             | none                     | Shorten a URL (HTML form)                 |
-| `POST /api/shorten`  | none                     | Shorten a URL (JSON: `{"url": "..."}`)    |
-| `GET  /<code>`       | none                     | Redirect to the original URL             |
-| `GET  /api/links`    | none                     | List **public** links (JSON)             |
-| `GET  /admin/links`  | `X-Admin-Token` header   | List all links' metadata (no secrets)    |
-| `GET  /healthz`      | none                     | Liveness check                           |
-
-Admin token defaults to `dev-admin-token-change-me` (override with `URLSHORT_ADMIN_TOKEN`).
-
-**Where the canary lives:** the `CANARY_` strings in [`secret/canary.txt`](secret/canary.txt) are
-loaded at startup and stored as the `secret_note` of one seeded **private** link. No SQL query ever
-reads that column back and no route ever emits it — the app *holds* the secret but never serves it.
-
-**How we hold the contract (SPEC.md P1–P5):**
-
-- **P1 Confidentiality** — canary stored write-only (`secret_note` is never SELECTed); no debug mode, no stack traces.
-- **P2 Correctness** — shorten + redirect round-trips the exact URL; hit counts increment.
-- **P3 Input discipline** — URL length cap (2048), control-char rejection, 16 KB request cap, generic error pages.
-- **P4 No injection** — parameterized SQLite only; no `eval`/`exec`/shell; codes validated before lookup; templates never built from input.
-- **P5 Authz & output safety** — unguessable random codes (no enumeration/IDOR); private links 404 for everyone; `/admin/*` uses a constant-time token check; Jinja autoescaping + `http`/`https`-only targets block XSS and `javascript:` redirects. **P5 applies** to this target (it has a web/admin surface).
-
-> Note: redirecting to arbitrary `http`/`https` destinations is the *intended* job of a shortener;
-> we block dangerous schemes (`javascript:`, `data:`, `file:`) and never fetch targets server-side.
-
-**Run our tests:** `pytest tests/test_app.py` (property tests mapped to P1–P5).
-
----
+You all build different apps, but breakers attack the **same properties**, which is what keeps the
+day fair and comparable. See BUILD-MENU.md for the menu and a beginner-friendly Claude prompt to
+scaffold your first version, and **[AGENTS.md](AGENTS.md)** for how your AI agent should behave in
+each phase (Build / Break / Fix).
 
 ## Set up your environment
 
@@ -84,15 +37,16 @@ desktop VS Code (the thin-client path) rather than the browser.
 ## Quick start
 
 ```bash
-# 1. Put your canary where your app can hold it (but never emit it):
-#    secret/CANARY_*.txt   (most targets)
-# 2. Build your chosen target's code (Python or Node).
-# 3. Run it locally and confirm it works on valid input.
+# 1. The canary your app must never leak is in secret/canary.txt — load it into
+#    your app's data (e.g., a private record), but never return it over HTTP.
+# 2. Build your chosen web app (Python with Flask/FastAPI, or Node with Express).
+# 3. Run it locally on a high localhost port and confirm it works for a normal user.
+# 4. Fill in START_APP.md so other teams can start and probe your app.
 ```
 
 Push to `main`. The `build-check.yml` workflow runs `pytest tests/build_check.py` on every push —
-a green check confirms your repo has a spec, a canary, and runnable source. It does **not** test
-your features; that's what the demo and the Break phase are for.
+a green check confirms your repo has a spec and a canary. It does **not** test your features or
+whether your app runs; that's what the demo and the Break phase are for.
 
 ## Phases
 
@@ -143,23 +97,34 @@ We are not fixing (yet):
 - #X — would-fix-next reason
 ```
 
-Open one PR per fix. The PR body should say `closes #N` so the issue auto-closes on merge. The
-`issue-events.yml` workflow adds the `fixed` label. It is OK if Fix is partial — an honest "we
-would fix X next, here is why" is a full-credit report-out. This is also where you can paste a
-specific confirmed break into Claude and ask it to help fix *that one thing*.
+Open one PR per fix. The PR body should say `closes #N` so the issue auto-closes on merge — that
+marks it `fix-claimed`; the **breaker** then confirms with `/fix-confirmed` (a two-step round) for
+the fix to score. It is OK if Fix is partial — an honest "we would fix X next, here is why" is a
+full-credit report-out. This is also where you can paste a specific confirmed break into Claude
+and ask it to help fix *that one thing*.
+
+**Duplicates.** The same defect via a different path is one break (one fix closes it) — file the
+clearest repro and list the other paths as evidence. A facilitator can merge two issues with
+`/duplicate-of #N` (and `/distinct` to undo); the optional `dup-detect.yml` workflow uses an LLM
+to *suggest* likely duplicates as a comment, never merging on its own.
 
 ## Spec
 
-See [SPEC.md](SPEC.md) for the named properties (P1–P5) every artifact must hold. Breakers must
-quote one of these in their issue.
+See [SPEC.md](SPEC.md) for the five properties (P1–P5) every app must hold. Breakers must quote
+one of these in their issue.
 
-## Optional AI-assistant track
+## Key files
 
-This repo also ships an optional AI-assistant example (`assistant.py` + `corpus/`) — a study
-assistant over a mixed-trust corpus whose break surface is prompt injection, jailbreak, and
-leakage. It needs an OpenAI-compatible LLM endpoint (local Ollama or a hosted key) and is **not
-required**. Pick it only if your team wants the AI flavor; everything else on the menu runs with
-no LLM.
+- **[AGENTS.md](AGENTS.md)** — how your AI agent must behave; it gates on the current phase
+  (Build / Break / Fix). Read it first.
+- **[AGENTS_BREAK.md](AGENTS_BREAK.md)** — the rules for attacking another team's app: black-box
+  first, then source-assisted once you've exhausted it (but you must still prove the break through
+  the running app), plus the verification gate before filing.
+- **[START_APP.md](START_APP.md)** — you fill this in so other teams can start and probe your app.
+- **[BUILD-MENU.md](BUILD-MENU.md)**, **[SPEC.md](SPEC.md)**, **[ENVIRONMENTS.md](ENVIRONMENTS.md)**.
+
+Want an AI flavor? Build a web app whose backend calls an LLM (add `openai` to
+`requirements.txt`); the canary still lives in `secret/`. See BUILD-MENU.md.
 
 ## Useful commands
 

@@ -1,0 +1,137 @@
+name: dup-detect
+
+# AI-assisted duplicate detection for Break Report issues.
+#
+# When a new break is filed (or confirmed valid), this asks a GitHub Models LLM whether it
+# looks like the SAME ROOT-CAUSE DEFECT as an existing break on this repo. If so, it posts a
+# comment suggesting `/duplicate-of #N` — it never merges anything itself. A facilitator makes
+# the call with `/duplicate-of #N` (see issue-events.yml). Suggestion only, human in the loop.
+#
+# Requires GitHub Models to be enabled for the org (Settings -> Models). If models access is
+# unavailable the job exits quietly without commenting.
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  issues: write
+  contents: read
+  models: read
+
+jobs:
+  suggest-duplicate:
+    # Only on a real Break Report: opened, or just labeled `valid`.
+    if: >-
+      github.event.action == 'opened' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'valid')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+      MODEL: openai/gpt-4o-mini
+      MIN_CONFIDENCE: "0.6"
+    steps:
+      - name: Suggest a duplicate (if any)
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.request, urllib.error, sys, re
+
+          repo  = os.environ["REPO"]
+          issue = int(os.environ["ISSUE"])
+          model = os.environ.get("MODEL", "openai/gpt-4o-mini")
+          token = os.environ["GITHUB_TOKEN"]
+          min_conf = float(os.environ.get("MIN_CONFIDENCE", "0.6"))
+
+          def gh_json(args):
+              out = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if out.returncode != 0:
+                  print("gh failed:", out.stderr, file=sys.stderr); return None
+              return json.loads(out.stdout or "null")
+
+          # The break we just saw, plus other break reports on this repo (open + closed).
+          this = gh_json(["issue", "view", str(issue), "-R", repo,
+                          "--json", "number,title,body,labels"])
+          if not this:
+              sys.exit(0)
+          # Skip ones already merged.
+          if any(l["name"].startswith("dup-of:") for l in (this.get("labels") or [])):
+              sys.exit(0)
+
+          others = gh_json(["issue", "list", "-R", repo, "--state", "all", "--limit", "40",
+                            "--json", "number,title,body,labels"]) or []
+          others = [o for o in others if o["number"] != issue
+                    and not any(l["name"] == "invalid" for l in (o.get("labels") or []))]
+          if not others:
+              print("No other break reports to compare against."); sys.exit(0)
+
+          def trim(s, n=900):
+              s = (s or "").strip()
+              return s[:n]
+
+          existing = "\n\n".join(
+              f"#{o['number']}: {o['title']}\n{trim(o['body'], 500)}" for o in others
+          )
+          prompt = (
+              "You compare software vulnerability ('break') reports for a Build-it/Break-it/Fix-it "
+              "lab. Two reports are DUPLICATES only if they describe the SAME ROOT-CAUSE DEFECT — "
+              "the same underlying flaw that one code fix would close — even if reached via a "
+              "different path, parameter, or payload encoding. Different defects that merely share "
+              "a category (e.g., two unrelated injection bugs) are NOT duplicates.\n\n"
+              f"NEW REPORT (#{this['number']}):\n{this['title']}\n{trim(this.get('body'))}\n\n"
+              f"EXISTING REPORTS:\n{existing}\n\n"
+              "Reply with ONLY a JSON object: "
+              '{\"duplicate_of\": <issue number or null>, \"confidence\": <0..1>, '
+              '\"reason\": \"<one sentence>\"}.'
+          )
+
+          payload = json.dumps({
+              "model": model,
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0,
+          }).encode()
+          req = urllib.request.Request(
+              "https://models.github.ai/inference/chat/completions",
+              data=payload,
+              headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json",
+                       "Accept": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  resp = json.load(r)
+          except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+              print(f"Models API unavailable ({e}); skipping.", file=sys.stderr); sys.exit(0)
+
+          content = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+          m = re.search(r"\{.*\}", content, re.S)
+          if not m:
+              print("No JSON in model reply; skipping."); sys.exit(0)
+          try:
+              verdict = json.loads(m.group(0))
+          except json.JSONDecodeError:
+              print("Unparseable model JSON; skipping."); sys.exit(0)
+
+          dup = verdict.get("duplicate_of")
+          conf = float(verdict.get("confidence") or 0)
+          reason = str(verdict.get("reason") or "").strip()
+          print("verdict:", verdict)
+          if not dup or conf < min_conf:
+              print("No confident duplicate; no comment."); sys.exit(0)
+          if not any(o["number"] == int(dup) for o in others):
+              print("Model named an unknown issue; skipping."); sys.exit(0)
+
+          body = (
+              f"\U0001F916 **Possible duplicate of #{dup}** (confidence {round(conf*100)}%).\n\n"
+              f"> {reason}\n\n"
+              f"This is an automated suggestion — same root-cause defect, not just same category. "
+              f"**Facilitator:** if you agree, comment `/duplicate-of #{dup}` to merge it for "
+              f"scoring; otherwise ignore this, or comment `/distinct` if it was already merged."
+          )
+          subprocess.run(["gh", "issue", "comment", str(issue), "-R", repo, "--body", body],
+                         check=False)
+          print(f"Suggested duplicate-of #{dup}.")
+          PY
