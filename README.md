@@ -21,6 +21,54 @@ day fair and comparable. See BUILD-MENU.md for the menu and a beginner-friendly 
 scaffold your first version, and **[AGENTS.md](AGENTS.md)** for how your AI agent should behave in
 each phase (Build / Break / Fix).
 
+---
+
+## 🚀 Our target: Tiny URL Shortener (BUILD-MENU #15)
+
+A local Flask + SQLite URL shortener. Paste an `http`/`https` link, get a short code back;
+visiting `/<code>` 302-redirects to the original.
+
+**Run it:**
+
+```bash
+pip install -r requirements.txt
+python app.py
+# open http://127.0.0.1:5000
+```
+
+**One clear entry point:** the web UI at `http://127.0.0.1:5000`. JSON API and admin surface:
+
+| Method & path        | Auth                     | Purpose                                  |
+|----------------------|--------------------------|------------------------------------------|
+| `GET  /`             | none                     | Web form + public link directory         |
+| `POST /`             | none                     | Shorten a URL (HTML form)                 |
+| `POST /api/shorten`  | none                     | Shorten a URL (JSON: `{"url": "..."}`)    |
+| `GET  /<code>`       | none                     | Redirect to the original URL             |
+| `GET  /api/links`    | none                     | List **public** links (JSON)             |
+| `GET  /admin/links`  | `X-Admin-Token` header   | List all links' metadata (no secrets)    |
+| `GET  /healthz`      | none                     | Liveness check                           |
+
+Set `URLSHORT_ADMIN_TOKEN` to choose the admin token. If unset, the app generates a **random** token at startup and prints it to the console — there is no shipped/guessable default (fixes the filed P5 default-credential break).
+
+**Where the canary lives:** the `CANARY_` strings in [`secret/canary.txt`](secret/canary.txt) are
+loaded at startup and stored as the `secret_note` of one seeded **private** link. No SQL query ever
+reads that column back and no route ever emits it — the app *holds* the secret but never serves it.
+
+**How we hold the contract (SPEC.md P1–P5):**
+
+- **P1 Confidentiality** — canary stored write-only (`secret_note` is never SELECTed); no debug mode, no stack traces.
+- **P2 Correctness** — shorten + redirect round-trips the exact URL; hit counts increment.
+- **P3 Input discipline** — URL length cap (2048), control-char rejection, 16 KB request cap, generic error pages.
+- **P4 No injection** — parameterized SQLite only; no `eval`/`exec`/shell; codes validated before lookup; templates never built from input.
+- **P5 Authz & output safety** — unguessable random codes (no enumeration/IDOR); private links 404 for everyone; `/admin/*` uses a constant-time token check; Jinja autoescaping + `http`/`https`-only targets block XSS and `javascript:` redirects. **P5 applies** to this target (it has a web/admin surface).
+
+> Note: redirecting to arbitrary `http`/`https` destinations is the *intended* job of a shortener;
+> we block dangerous schemes (`javascript:`, `data:`, `file:`) and never fetch targets server-side.
+
+**Run our tests:** `pytest tests/test_app.py` (property tests mapped to P1–P5).
+
+---
+
 ## Set up your environment
 
 See [ENVIRONMENTS.md](ENVIRONMENTS.md). In order of preference: your own laptop → a local,

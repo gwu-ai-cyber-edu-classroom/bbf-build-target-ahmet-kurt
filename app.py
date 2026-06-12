@@ -25,7 +25,7 @@ Run:
 
 Config (all optional, via environment):
     URLSHORT_DB            SQLite path                (default data/urls.db)
-    URLSHORT_ADMIN_TOKEN   admin bearer token         (default dev-admin-token-change-me)
+    URLSHORT_ADMIN_TOKEN   admin bearer token         (unset -> a random token is generated + printed at startup)
     URLSHORT_CANARY_FILE   file holding CANARY_ lines (default secret/canary.txt)
     PORT                   listen port                (default 5000)
 """
@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import secrets
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -203,9 +204,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config.update(
         DB_PATH=os.environ.get("URLSHORT_DB", os.path.join("data", "urls.db")),
-        ADMIN_TOKEN=os.environ.get(
-            "URLSHORT_ADMIN_TOKEN", "dev-admin-token-change-me"
-        ),
+        # No shipped default: a known/guessable admin token would defeat /admin
+        # authorization (the filed P5 break). Use the env var if set, otherwise a
+        # random per-run token is minted below.
+        ADMIN_TOKEN=os.environ.get("URLSHORT_ADMIN_TOKEN"),
         CANARY_FILE=os.environ.get(
             "URLSHORT_CANARY_FILE", os.path.join("secret", "canary.txt")
         ),
@@ -214,6 +216,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
     if test_config:
         app.config.update(test_config)
+
+    # Secure by default: never authenticate admins with a hardcoded value. If no
+    # token was configured (env or test), mint a strong random one for this run
+    # and show it once on the console so the operator can use it.
+    if not app.config.get("ADMIN_TOKEN"):
+        generated = secrets.token_urlsafe(32)
+        app.config["ADMIN_TOKEN"] = generated
+        print(
+            "[urlshortener] URLSHORT_ADMIN_TOKEN not set; generated a random admin "
+            "token for this run:\n"
+            f"    {generated}\n"
+            "    (admin endpoints are unreachable without it; set "
+            "URLSHORT_ADMIN_TOKEN to choose your own)",
+            file=sys.stderr,
+        )
 
     app.teardown_appcontext(close_db)
     init_db(app)
@@ -311,9 +328,9 @@ def require_admin() -> None:
     from flask import abort
 
     token = request.headers.get("X-Admin-Token", "")
-    expected = current_app.config["ADMIN_TOKEN"]
-    # constant-time compare avoids leaking the token via response timing
-    if not secrets.compare_digest(token, expected):
+    expected = current_app.config.get("ADMIN_TOKEN") or ""
+    # Fail closed if somehow unset; constant-time compare avoids timing leaks.
+    if not expected or not secrets.compare_digest(token, expected):
         abort(401)
 
 
